@@ -4,181 +4,311 @@ const server = require('http').createServer(app);
 const io = require('socket.io')(server, {
 	cors: {
 		origin: "*",
-		methods: ["GET", "POST"],
+		methods: ["GET", "POST", "OPTIONS"],
 		allowedHeaders: ["*"],
 		credentials: true
 	},
-	transports: ['websocket'],
+	allowEIO3: true,
+	transports: ['websocket', 'polling'],
 	pingTimeout: 60000,
-	pingInterval: 25000
+	pingInterval: 25000,
+	path: '/socket.io/'
 });
 
 const PORT = process.env.PORT || 3000;
 
-// Stockage des utilisateurs connectés
-const connectedUsers = new Map();
+// Structure de données pour les utilisateurs
+class User {
+	constructor(socketId, userType, name = '') {
+		this.socketId = socketId;
+		this.userType = userType;
+		this.name = name;
+		this.isAvailable = userType === 'confident' ? true : false;
+		this.currentCallId = null;
+	}
+}
 
-// Middleware CORS pour les routes Express
+// Gestionnaire d'état global
+class StateManager {
+	constructor() {
+		this.users = new Map();       // userId -> User
+		this.calls = new Map();       // callId -> Call
+		this.sockets = new Map();     // socketId -> userId
+	}
+
+	addUser(userId, socketId, userType, name = '') {
+		const user = new User(socketId, userType, name);
+		this.users.set(userId, user);
+		this.sockets.set(socketId, userId);
+		return user;
+	}
+
+	removeUser(userId) {
+		const user = this.users.get(userId);
+		if (user) {
+			this.sockets.delete(user.socketId);
+			this.users.delete(userId);
+		}
+	}
+
+	getUserBySocket(socketId) {
+		const userId = this.sockets.get(socketId);
+		return userId ? this.users.get(userId) : null;
+	}
+
+	getAvailableConfidents() {
+		return Array.from(this.users.entries())
+			.filter(([_, user]) => user.userType === 'confident' && user.isAvailable)
+			.map(([id, user]) => ({
+				userId: id,
+				name: user.name,
+				isAvailable: true
+			}));
+	}
+}
+
+const state = new StateManager();
+
+// Middleware CORS
 app.use((req, res, next) => {
 	res.header('Access-Control-Allow-Origin', '*');
-	res.header('Access-Control-Allow-Methods', 'GET, POST');
-	res.header('Access-Control-Allow-Headers', '*');
+	res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+	res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Sec-WebSocket-Protocol');
+	res.header('Access-Control-Allow-Credentials', 'true');
+	
+	if (req.method === 'OPTIONS') {
+		return res.status(200).end();
+	}
 	next();
 });
 
-// Route de test
+// Routes API
 app.get('/', (req, res) => {
-	res.send('Serveur de signaling en fonctionnement');
+	res.send('Serveur de signaling WebRTC en fonctionnement');
 });
 
-// Gestion des connexions WebSocket
+app.get('/status', (req, res) => {
+	const status = {
+		connectedUsers: state.users.size,
+		availableConfidents: state.getAvailableConfidents().length,
+		activeConnections: io.engine.clientsCount
+	};
+	res.json(status);
+});
+
+// Gestionnaire WebSocket
 io.on('connection', (socket) => {
-	console.log('Nouvelle connexion établie:', socket.id);
+	console.log('🔌 Nouvelle connexion:', socket.id);
 
-	// Enregistrement des utilisateurs
+	// Enregistrement
 	socket.on('register', (data) => {
-		const { userId, userType } = data;
-		connectedUsers.set(userId, {
-			socketId: socket.id,
-			userType: userType,
-			isAvailable: userType === 'user' ? true : false
-		});
-		
-		console.log(`${userType} enregistré:`, userId);
+		try {
+			const { userId, userType, name = '' } = data;
+			
+			if (!userId || !userType) {
+				throw new Error('Données d\'enregistrement invalides');
+			}
 
-		if (userType === 'confident') {
-			broadcastConfidentStatus(userId);
-		} else {
-			sendAvailableConfidents(socket);
+			const user = state.addUser(userId, socket.id, userType, name);
+			console.log(`✅ ${userType} enregistré:`, userId);
+
+			// Envoi de la confirmation
+			socket.emit('registered', {
+				success: true,
+				userId: userId,
+				userType: userType
+			});
+
+			// Si c'est un utilisateur, envoi la liste des confidents disponibles
+			if (userType === 'user') {
+				socket.emit('available-confidents', {
+					confidents: state.getAvailableConfidents()
+				});
+			}
+
+			// Notification aux autres utilisateurs
+			if (userType === 'confident') {
+				socket.broadcast.emit('confident-status-update', {
+					confidentId: userId,
+					isAvailable: user.isAvailable,
+					name: user.name
+				});
+			}
+		} catch (error) {
+			console.error('❌ Erreur d\'enregistrement:', error);
+			socket.emit('error', {
+				type: 'REGISTRATION_ERROR',
+				message: error.message
+			});
 		}
 	});
 
 	// Gestion de la disponibilité
-	socket.on('update-availability', (available) => {
-		const userId = getUserIdBySocketId(socket.id);
-		if (userId) {
-			const userData = connectedUsers.get(userId);
-			if (userData && userData.userType === 'confident') {
-				userData.isAvailable = available;
-				console.log(`Statut du confident ${userId} mis à jour: ${available ? 'disponible' : 'indisponible'}`);
-				broadcastConfidentStatus(userId);
+	socket.on('update-availability', (data) => {
+		try {
+			const { available } = data;
+			const user = state.getUserBySocket(socket.id);
+			
+			if (!user || user.userType !== 'confident') {
+				throw new Error('Utilisateur non autorisé');
 			}
-		}
-	});
 
-	// Gestion des appels
-	socket.on('call-request', (targetConfidentId) => {
-		const confidentData = connectedUsers.get(targetConfidentId);
-		if (confidentData && confidentData.isAvailable) {
-			console.log(`Demande d'appel vers le confident: ${targetConfidentId}`);
-			io.to(confidentData.socketId).emit('incoming-call', {
-				callerId: getUserIdBySocketId(socket.id)
+			user.isAvailable = available;
+			
+			// Notification du changement de statut
+			io.emit('confident-status-update', {
+				confidentId: state.sockets.get(socket.id),
+				isAvailable: available,
+				name: user.name
 			});
-		} else {
-			socket.emit('call-failed', {
-				reason: 'Confident non disponible'
-			});
-		}
-	});
-
-	// Réponse aux appels
-	socket.on('call-response', (data) => {
-		const { callerId, accepted } = data;
-		const callerData = connectedUsers.get(callerId);
-		if (callerData) {
-			io.to(callerData.socketId).emit('call-answered', {
-				accepted,
-				confidentId: getUserIdBySocketId(socket.id)
+		} catch (error) {
+			console.error('❌ Erreur de mise à jour de disponibilité:', error);
+			socket.emit('error', {
+				type: 'AVAILABILITY_UPDATE_ERROR',
+				message: error.message
 			});
 		}
 	});
 
 	// Signaling WebRTC
 	socket.on('webrtc-offer', (data) => {
-		const { targetId, offer } = data;
-		const targetData = connectedUsers.get(targetId);
-		if (targetData) {
-			io.to(targetData.socketId).emit('webrtc-offer', {
+		try {
+			const { targetId, offer } = data;
+			const user = state.getUserBySocket(socket.id);
+			const targetUser = state.users.get(targetId);
+
+			if (!targetUser) {
+				throw new Error('Utilisateur cible non trouvé');
+			}
+
+			io.to(targetUser.socketId).emit('webrtc-offer', {
 				offer,
-				callerId: getUserIdBySocketId(socket.id)
+				userId: state.sockets.get(socket.id)
+			});
+		} catch (error) {
+			console.error('❌ Erreur d\'envoi d\'offre WebRTC:', error);
+			socket.emit('error', {
+				type: 'WEBRTC_OFFER_ERROR',
+				message: error.message
 			});
 		}
 	});
 
 	socket.on('webrtc-answer', (data) => {
-		const { targetId, answer } = data;
-		const targetData = connectedUsers.get(targetId);
-		if (targetData) {
-			io.to(targetData.socketId).emit('webrtc-answer', {
+		try {
+			const { targetId, answer } = data;
+			const targetUser = state.users.get(targetId);
+
+			if (!targetUser) {
+				throw new Error('Utilisateur cible non trouvé');
+			}
+
+			io.to(targetUser.socketId).emit('webrtc-answer', {
 				answer,
-				confidentId: getUserIdBySocketId(socket.id)
+				userId: state.sockets.get(socket.id)
+			});
+		} catch (error) {
+			console.error('❌ Erreur d\'envoi de réponse WebRTC:', error);
+			socket.emit('error', {
+				type: 'WEBRTC_ANSWER_ERROR',
+				message: error.message
 			});
 		}
 	});
 
 	socket.on('ice-candidate', (data) => {
-		const { targetId, candidate } = data;
-		const targetData = connectedUsers.get(targetId);
-		if (targetData) {
-			io.to(targetData.socketId).emit('ice-candidate', {
-				candidate,
-				fromId: getUserIdBySocketId(socket.id)
-			});
-		}
-	});
+		try {
+			const { targetId, candidate } = data;
+			const targetUser = state.users.get(targetId);
 
-	// Fin d'appel
-	socket.on('end-call', (targetId) => {
-		const targetData = connectedUsers.get(targetId);
-		if (targetData) {
-			io.to(targetData.socketId).emit('call-ended', {
-				fromId: getUserIdBySocketId(socket.id)
-			});
-		}
-	});
-
-	// Déconnexion
-	socket.on('disconnect', () => {
-		const userId = getUserIdBySocketId(socket.id);
-		if (userId) {
-			const userData = connectedUsers.get(userId);
-			if (userData && userData.userType === 'confident') {
-				io.emit('confident-disconnected', { confidentId: userId });
+			if (!targetUser) {
+				throw new Error('Utilisateur cible non trouvé');
 			}
-			connectedUsers.delete(userId);
-			console.log(`Utilisateur déconnecté: ${userId}`);
+
+			io.to(targetUser.socketId).emit('ice-candidate', {
+				candidate,
+				userId: state.sockets.get(socket.id)
+			});
+		} catch (error) {
+			console.error('❌ Erreur d\'envoi de candidat ICE:', error);
+			socket.emit('error', {
+				type: 'ICE_CANDIDATE_ERROR',
+				message: error.message
+			});
+		}
+	});
+
+	// Gestion de fin d'appel
+	socket.on('end-call', (data) => {
+		try {
+			const { targetId } = data;
+			const user = state.getUserBySocket(socket.id);
+			const targetUser = state.users.get(targetId);
+
+			if (!targetUser) {
+				throw new Error('Utilisateur cible non trouvé');
+			}
+
+			io.to(targetUser.socketId).emit('call-ended', {
+				userId: state.sockets.get(socket.id)
+			});
+
+			// Réinitialisation des états
+			if (user) user.currentCallId = null;
+			targetUser.currentCallId = null;
+		} catch (error) {
+			console.error('❌ Erreur de fin d\'appel:', error);
+			socket.emit('error', {
+				type: 'END_CALL_ERROR',
+				message: error.message
+			});
+		}
+	});
+
+	// Gestion de la déconnexion
+	socket.on('disconnect', () => {
+		const userId = state.sockets.get(socket.id);
+		if (userId) {
+			const user = state.users.get(userId);
+			if (user && user.userType === 'confident') {
+				io.emit('confident-disconnected', {
+					confidentId: userId
+				});
+			}
+			state.removeUser(userId);
+			console.log(`👋 Utilisateur déconnecté: ${userId}`);
 		}
 	});
 });
 
-// Fonctions utilitaires
-function broadcastConfidentStatus(confidentId) {
-	const confidentData = connectedUsers.get(confidentId);
-	if (confidentData) {
-		io.emit('confident-status-update', {
-			confidentId,
-			isAvailable: confidentData.isAvailable
-		});
-	}
-}
+// Gestion des erreurs globales
+io.on('error', (error) => {
+	console.error('🚨 Erreur Socket.IO:', error);
+});
 
-function sendAvailableConfidents(socket) {
-	const availableConfidents = Array.from(connectedUsers.entries())
-		.filter(([_, data]) => data.userType === 'confident' && data.isAvailable)
-		.map(([id, _]) => id);
-	
-	socket.emit('available-confidents', availableConfidents);
-}
+process.on('uncaughtException', (error) => {
+	console.error('🚨 Erreur non gérée:', error);
+});
 
-function getUserIdBySocketId(socketId) {
-	for (const [userId, data] of connectedUsers.entries()) {
-		if (data.socketId === socketId) return userId;
-	}
-	return null;
-}
+process.on('unhandledRejection', (reason, promise) => {
+	console.error('🚨 Promesse rejetée non gérée:', reason);
+});
 
 // Démarrage du serveur
 server.listen(PORT, () => {
-	console.log(`Serveur de signaling démarré sur le port ${PORT}`);
-	console.log(`WebSocket prêt à accepter les connexions`);
+	console.log(`
+	🚀 Serveur de signaling démarré
+	🌐 Port: ${PORT}
+	📡 WebSocket prêt
+	⚡ Mode: ${process.env.NODE_ENV || 'development'}
+	`);
+});
+
+// Nettoyage à la fermeture
+process.on('SIGTERM', () => {
+	console.log('Signal SIGTERM reçu. Arrêt du serveur...');
+	server.close(() => {
+		console.log('Serveur arrêté');
+		process.exit(0);
+	});
 });
