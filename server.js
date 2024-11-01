@@ -1,15 +1,32 @@
 const express = require('express');
 const app = express();
-const server = require('http').Server(app);
-const io = require('socket.io')(server);
+const server = require('http').createServer(app);
+const io = require('socket.io')(server, {
+	cors: {
+		origin: "*",
+		methods: ["GET", "POST"],
+		allowedHeaders: ["*"],
+		credentials: true
+	},
+	transports: ['websocket'],
+	pingTimeout: 60000,
+	pingInterval: 25000
+});
 
 const PORT = process.env.PORT || 3000;
 
-// Structure pour stocker les informations des utilisateurs connectés
-// Format: { userId: { socketId, userType, isAvailable } }
+// Stockage des utilisateurs connectés
 const connectedUsers = new Map();
 
-// Route de base pour vérifier que le serveur fonctionne
+// Middleware CORS pour les routes Express
+app.use((req, res, next) => {
+	res.header('Access-Control-Allow-Origin', '*');
+	res.header('Access-Control-Allow-Methods', 'GET, POST');
+	res.header('Access-Control-Allow-Headers', '*');
+	next();
+});
+
+// Route de test
 app.get('/', (req, res) => {
 	res.send('Serveur de signaling en fonctionnement');
 });
@@ -18,28 +35,25 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
 	console.log('Nouvelle connexion établie:', socket.id);
 
-	// Gestion de l'enregistrement des utilisateurs (users et confidents)
+	// Enregistrement des utilisateurs
 	socket.on('register', (data) => {
 		const { userId, userType } = data;
 		connectedUsers.set(userId, {
 			socketId: socket.id,
-			userType: userType, // 'user' ou 'confident'
-			isAvailable: userType === 'user' ? true : false // Les confidents démarrent non disponibles
+			userType: userType,
+			isAvailable: userType === 'user' ? true : false
 		});
 		
 		console.log(`${userType} enregistré:`, userId);
 
-		// Si c'est un confident qui se connecte, informer tous les users
 		if (userType === 'confident') {
 			broadcastConfidentStatus(userId);
-		}
-		// Si c'est un user, lui envoyer la liste des confidents disponibles
-		else {
+		} else {
 			sendAvailableConfidents(socket);
 		}
 	});
 
-	// Gestion du changement de disponibilité des confidents
+	// Gestion de la disponibilité
 	socket.on('update-availability', (available) => {
 		const userId = getUserIdBySocketId(socket.id);
 		if (userId) {
@@ -52,7 +66,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion des demandes d'appel
+	// Gestion des appels
 	socket.on('call-request', (targetConfidentId) => {
 		const confidentData = connectedUsers.get(targetConfidentId);
 		if (confidentData && confidentData.isAvailable) {
@@ -61,14 +75,13 @@ io.on('connection', (socket) => {
 				callerId: getUserIdBySocketId(socket.id)
 			});
 		} else {
-			// Informer l'appelant que le confident n'est pas disponible
 			socket.emit('call-failed', {
 				reason: 'Confident non disponible'
 			});
 		}
 	});
 
-	// Gestion de la réponse à l'appel
+	// Réponse aux appels
 	socket.on('call-response', (data) => {
 		const { callerId, accepted } = data;
 		const callerData = connectedUsers.get(callerId);
@@ -80,7 +93,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion des offres WebRTC
+	// Signaling WebRTC
 	socket.on('webrtc-offer', (data) => {
 		const { targetId, offer } = data;
 		const targetData = connectedUsers.get(targetId);
@@ -92,7 +105,6 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion des réponses WebRTC
 	socket.on('webrtc-answer', (data) => {
 		const { targetId, answer } = data;
 		const targetData = connectedUsers.get(targetId);
@@ -104,7 +116,6 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion des candidats ICE
 	socket.on('ice-candidate', (data) => {
 		const { targetId, candidate } = data;
 		const targetData = connectedUsers.get(targetId);
@@ -116,7 +127,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de la fin d'appel
+	// Fin d'appel
 	socket.on('end-call', (targetId) => {
 		const targetData = connectedUsers.get(targetId);
 		if (targetData) {
@@ -126,13 +137,12 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de la déconnexion
+	// Déconnexion
 	socket.on('disconnect', () => {
 		const userId = getUserIdBySocketId(socket.id);
 		if (userId) {
 			const userData = connectedUsers.get(userId);
 			if (userData && userData.userType === 'confident') {
-				// Informer les users de la déconnexion du confident
 				io.emit('confident-disconnected', { confidentId: userId });
 			}
 			connectedUsers.delete(userId);
@@ -141,7 +151,7 @@ io.on('connection', (socket) => {
 	});
 });
 
-// Fonction pour diffuser le statut d'un confident à tous les users
+// Fonctions utilitaires
 function broadcastConfidentStatus(confidentId) {
 	const confidentData = connectedUsers.get(confidentId);
 	if (confidentData) {
@@ -152,7 +162,6 @@ function broadcastConfidentStatus(confidentId) {
 	}
 }
 
-// Fonction pour envoyer la liste des confidents disponibles à un user
 function sendAvailableConfidents(socket) {
 	const availableConfidents = Array.from(connectedUsers.entries())
 		.filter(([_, data]) => data.userType === 'confident' && data.isAvailable)
@@ -161,7 +170,6 @@ function sendAvailableConfidents(socket) {
 	socket.emit('available-confidents', availableConfidents);
 }
 
-// Fonction utilitaire pour retrouver l'ID d'un utilisateur à partir de son socketId
 function getUserIdBySocketId(socketId) {
 	for (const [userId, data] of connectedUsers.entries()) {
 		if (data.socketId === socketId) return userId;
@@ -172,4 +180,5 @@ function getUserIdBySocketId(socketId) {
 // Démarrage du serveur
 server.listen(PORT, () => {
 	console.log(`Serveur de signaling démarré sur le port ${PORT}`);
+	console.log(`WebSocket prêt à accepter les connexions`);
 });
