@@ -1,20 +1,22 @@
 const express = require('express');
 const app = express();
-const server = require('http').createServer(app);
-const io = require('socket.io')(server, {
+const http = require('http');
+const server = http.createServer(app);
+const { Server } = require('socket.io');
+
+// Configuration optimisée de Socket.IO
+const io = new Server(server, {
 	cors: {
-		origin: "*",
+		origin: "*", // À ajuster selon vos besoins de sécurité
 		methods: ["GET", "POST", "OPTIONS"],
 		allowedHeaders: ["*"],
 		credentials: true
 	},
-	allowEIO3: true,
 	transports: ['websocket', 'polling'],
-	pingTimeout: 120000,        // 2 minutes
-	pingInterval: 10000,        // 10 secondes
+	pingTimeout: 60000,        // 60 secondes
+	pingInterval: 25000,       // 25 secondes
 	path: '/socket.io/',
-	connectTimeout: 45000,
-	upgradeTimeout: 30000,
+	upgradeTimeout: 30000,     // 30 secondes
 	maxHttpBufferSize: 1e8,
 	perMessageDeflate: false,
 	closeOnBeforeunload: false
@@ -47,7 +49,6 @@ class User {
 class StateManager {
 	constructor() {
 		this.users = new Map();
-		this.calls = new Map();
 		this.sockets = new Map();
 		this.pingIntervals = new Map();
 	}
@@ -144,9 +145,9 @@ class StateManager {
 
 const state = new StateManager();
 
-// Configuration CORS
+// Configuration CORS sécurisée
 app.use((req, res, next) => {
-	res.header('Access-Control-Allow-Origin', '*');
+	res.header('Access-Control-Allow-Origin', '*'); // À restreindre selon vos besoins
 	res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
 	res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Sec-WebSocket-Protocol');
 	res.header('Access-Control-Allow-Credentials', 'true');
@@ -174,16 +175,6 @@ app.get('/status', (req, res) => {
 // Gestionnaire WebSocket
 io.on('connection', (socket) => {
 	console.log('🔌 Nouvelle connexion:', socket.id);
-
-	// Surveillance des paquets pour maintenir la connexion
-	socket.conn.on('packet', (packet) => {
-		if (packet.type === 'ping') {
-			const user = state.getUserBySocket(socket.id);
-			if (user) {
-				user.updateLastPing();
-			}
-		}
-	});
 
 	// Gestion de l'enregistrement
 	socket.on('register', (data) => {
@@ -366,7 +357,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de la déconnexion avec retry
+	// Gestion de la déconnexion avec délai
 	socket.on('disconnect', () => {
 		const userId = state.sockets.get(socket.id);
 		if (userId) {
