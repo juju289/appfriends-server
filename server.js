@@ -1,3 +1,4 @@
+// Configuration du serveur Express et Socket.IO
 const express = require('express');
 const app = express();
 const server = require('http').createServer(app);
@@ -17,59 +18,69 @@ const io = require('socket.io')(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// Structure de données pour les utilisateurs
+// Structure de données pour un utilisateur
 class User {
 	constructor(socketId, userType, name = '') {
-		this.socketId = socketId;
-		this.userType = userType;
-		this.name = name;
-		this.isAvailable = userType === 'confident' ? true : false;
-		this.currentCallId = null;
+		this.socketId = socketId;     // ID unique de la connexion socket
+		this.userType = userType;     // 'user' ou 'confident'
+		this.name = name;             // Nom de l'utilisateur
+		this.isAvailable = false;     // Par défaut, non disponible
+		this.currentCallId = null;    // ID de l'appel en cours
 	}
 }
 
-// Gestionnaire d'état global
+// Gestionnaire global des états
 class StateManager {
 	constructor() {
-		this.users = new Map();       // userId -> User
-		this.calls = new Map();       // callId -> Call
-		this.sockets = new Map();     // socketId -> userId
+		this.users = new Map();       // Stockage des utilisateurs par ID
+		this.calls = new Map();       // Stockage des appels actifs
+		this.sockets = new Map();     // Liaison socket <-> userId
 	}
 
+	// Ajoute un nouvel utilisateur
 	addUser(userId, socketId, userType, name = '') {
+		console.log(`📝 Ajout utilisateur - Type: ${userType}, ID: ${userId}`);
 		const user = new User(socketId, userType, name);
 		this.users.set(userId, user);
 		this.sockets.set(socketId, userId);
 		return user;
 	}
 
+	// Supprime un utilisateur
 	removeUser(userId) {
 		const user = this.users.get(userId);
 		if (user) {
 			this.sockets.delete(user.socketId);
 			this.users.delete(userId);
+			console.log(`🗑️ Utilisateur supprimé: ${userId}`);
 		}
 	}
 
+	// Récupère un utilisateur par son socketId
 	getUserBySocket(socketId) {
 		const userId = this.sockets.get(socketId);
 		return userId ? this.users.get(userId) : null;
 	}
 
+	// Récupère la liste des confidents disponibles
 	getAvailableConfidents() {
-		return Array.from(this.users.entries())
+		console.log("🔍 Recherche des confidents disponibles...");
+		const confidents = Array.from(this.users.entries())
 			.filter(([_, user]) => user.userType === 'confident' && user.isAvailable)
 			.map(([id, user]) => ({
 				userId: id,
 				name: user.name,
 				isAvailable: true
 			}));
+		console.log(`👥 Confidents disponibles: ${confidents.length}`);
+		return confidents;
 	}
 }
 
+// Création de l'instance du gestionnaire d'état
 const state = new StateManager();
 
-// Middleware CORS
+// Configuration des middlewares CORS
 app.use((req, res, next) => {
 	res.header('Access-Control-Allow-Origin', '*');
 	res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -81,12 +92,12 @@ app.use((req, res, next) => {
 	}
 	next();
 });
-
-// Routes API
+// Routes HTTP de base
 app.get('/', (req, res) => {
 	res.send('Serveur de signaling WebRTC en fonctionnement');
 });
 
+// Route pour le statut du serveur
 app.get('/status', (req, res) => {
 	const status = {
 		connectedUsers: state.users.size,
@@ -96,13 +107,14 @@ app.get('/status', (req, res) => {
 	res.json(status);
 });
 
-// Gestionnaire WebSocket
+// Gestionnaire principal des connexions WebSocket
 io.on('connection', (socket) => {
 	console.log('🔌 Nouvelle connexion:', socket.id);
 
-	// Enregistrement
+	// Gestion de l'enregistrement des utilisateurs
 	socket.on('register', (data) => {
 		try {
+			console.log('📝 Données d\'enregistrement reçues:', data);
 			const { userId, userType, name = '' } = data;
 			
 			if (!userId || !userType) {
@@ -112,21 +124,22 @@ io.on('connection', (socket) => {
 			const user = state.addUser(userId, socket.id, userType, name);
 			console.log(`✅ ${userType} enregistré:`, userId);
 
-			// Envoi de la confirmation
+			// Confirmation d'enregistrement
 			socket.emit('registered', {
 				success: true,
 				userId: userId,
-				userType: userType
+				userType: userType,
+				isConfident: userType === 'confident'
 			});
 
-			// Si c'est un utilisateur, envoi la liste des confidents disponibles
+			// Envoi de la liste des confidents aux utilisateurs normaux
 			if (userType === 'user') {
 				socket.emit('available-confidents', {
 					confidents: state.getAvailableConfidents()
 				});
 			}
 
-			// Notification aux autres utilisateurs
+			// Notification du statut des confidents
 			if (userType === 'confident') {
 				socket.broadcast.emit('confident-status-update', {
 					confidentId: userId,
@@ -143,23 +156,35 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de la disponibilité
+	// Gestion de la mise à jour de disponibilité
 	socket.on('update-availability', (data) => {
 		try {
+			console.log('📝 Mise à jour disponibilité reçue:', data);
 			const { available } = data;
 			const user = state.getUserBySocket(socket.id);
 			
-			if (!user || user.userType !== 'confident') {
-				throw new Error('Utilisateur non autorisé');
+			if (!user) {
+				throw new Error('Utilisateur non trouvé');
+			}
+
+			if (user.userType !== 'confident') {
+				throw new Error('Seuls les confidents peuvent modifier leur disponibilité');
 			}
 
 			user.isAvailable = available;
 			
-			// Notification du changement de statut
+			// Notification globale du changement de statut
+			const userId = state.sockets.get(socket.id);
 			io.emit('confident-status-update', {
-				confidentId: state.sockets.get(socket.id),
+				confidentId: userId,
 				isAvailable: available,
 				name: user.name
+			});
+
+			// Confirmation à l'émetteur
+			socket.emit('availability-updated', {
+				success: true,
+				isAvailable: available
 			});
 		} catch (error) {
 			console.error('❌ Erreur de mise à jour de disponibilité:', error);
@@ -170,7 +195,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Signaling WebRTC
+	// Gestion des offres WebRTC
 	socket.on('webrtc-offer', (data) => {
 		try {
 			const { targetId, offer } = data;
@@ -194,6 +219,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
+	// Gestion des réponses WebRTC
 	socket.on('webrtc-answer', (data) => {
 		try {
 			const { targetId, answer } = data;
@@ -216,6 +242,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
+	// Gestion des candidats ICE
 	socket.on('ice-candidate', (data) => {
 		try {
 			const { targetId, candidate } = data;
@@ -238,7 +265,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de fin d'appel
+	// Gestion de la fin d'appel
 	socket.on('end-call', (data) => {
 		try {
 			const { targetId } = data;
@@ -253,7 +280,6 @@ io.on('connection', (socket) => {
 				userId: state.sockets.get(socket.id)
 			});
 
-			// Réinitialisation des états
 			if (user) user.currentCallId = null;
 			targetUser.currentCallId = null;
 		} catch (error) {
@@ -265,7 +291,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Gestion de la déconnexion
+	// Gestion des déconnexions
 	socket.on('disconnect', () => {
 		const userId = state.sockets.get(socket.id);
 		if (userId) {
@@ -281,11 +307,12 @@ io.on('connection', (socket) => {
 	});
 });
 
-// Gestion des erreurs globales
+// Gestion des erreurs Socket.IO
 io.on('error', (error) => {
 	console.error('🚨 Erreur Socket.IO:', error);
 });
 
+// Gestion des erreurs non attrapées
 process.on('uncaughtException', (error) => {
 	console.error('🚨 Erreur non gérée:', error);
 });
@@ -304,7 +331,7 @@ server.listen(PORT, () => {
 	`);
 });
 
-// Nettoyage à la fermeture
+// Gestion de l'arrêt propre
 process.on('SIGTERM', () => {
 	console.log('Signal SIGTERM reçu. Arrêt du serveur...');
 	server.close(() => {
